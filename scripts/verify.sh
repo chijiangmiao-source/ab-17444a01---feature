@@ -36,5 +36,5 @@ if [ "$status" != "healthy" ]; then
   exit 1
 fi
 
-echo "==> [3/3] 运行 verify 单次服务（测试 / 同优分类 / 零增程 / HTTP 冒烟）"
+echo "==> [3/3] 运行 verify 单次服务（测试 / 同优分类 / 零增程 / 转接高耗时绕行 / 禁行无解 / HTTP 冒烟）"
 docker compose run --rm verify

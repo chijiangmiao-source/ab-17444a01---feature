@@ -6,6 +6,29 @@ vertices to have even degree, the exact number of optimal duplicate sets, the
 canonical duplicate set (0-preferred bit vector in edge order), per-edge
 classification, and a closed Euler tour for the canonical augmentation.
 
+Transfer-time mode (``transfer_mode=True``)
+-------------------------------------------
+At a shared node the robot may continue from one pipe onto another; such a
+transfer carries a user supplied non-negative integer cost (unset = 0), or is
+forbidden.  Pairs of *distinct* edges only; reversing straight back along the
+same edge is always free (leaf pipes can only be inspected that way).  The
+objective is then
+
+    total time = sum of traversed pipe lengths + sum of per-transfer costs
+
+over closed walks based at the inspection port that use every pipe at least
+once and may reuse pipes freely.  This is NOT solved by fixing the ordinary
+minimum-augmentation set first: the walk space is searched directly.
+
+Each undirected edge becomes two directed darts (2i = u->v, 2i+1 = v->u).  A
+walk state is (covered-edge mask, current dart); moving onto dart d2 costs the
+transfer cost plus the length of d2 (taking d2 = d ^ 1 is the free reversal
+plus the length of walking the same pipe back).  Layered Dijkstra over this
+state graph finds the global optimum and the exact number of optimal walks;
+non-negative costs make every shortest state path simple.  Tight-edge
+back-marking followed by a lexicographic memo picks the canonical walk,
+adjudicated by (edge identifier, direction) sequences.
+
 Exact counting without enumeration
 ----------------------------------
 A duplicate set is a T-join: in the subgraph formed by the duplicated edges
@@ -108,6 +131,38 @@ class AuditResult:
     @property
     def is_eulerian(self) -> bool:
         return not self.odd_vertices
+
+
+@dataclass(frozen=True)
+class TransferRule:
+    edge_a: int
+    edge_b: int
+    cost: Optional[int]  # None == forbidden, otherwise non-negative integer
+    row: int
+
+
+@dataclass(frozen=True)
+class TransferStep:
+    edge_index: int
+    edge_id: str
+    frm: str
+    to: str
+    length: int
+    transfer_cost: int  # cost paid to enter this pipe from the previous one
+    rule: Optional[Tuple[int, int]]  # unordered edge-index pair of the transfer
+
+
+@dataclass
+class TransferResult:
+    nodes: List[str]
+    edges: List[Edge]
+    start: str
+    rules: Tuple[TransferRule, ...]
+    total_length: int          # sum of lengths over the canonical walk
+    transfer_time: int         # sum of transfer costs over the canonical walk
+    total_time: int
+    optimal_count: int
+    route: Tuple[TransferStep, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +284,137 @@ def validate_input(
         )
 
     return clean_nodes, edges
+
+
+def _as_nonneg_int(value) -> Optional[int]:
+    """Blank -> 0.  A bare 'x' style sentinel is handled by the caller."""
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        raise ValueError()
+    if isinstance(value, int):
+        iv = value
+    elif isinstance(value, str):
+        s = value.strip()
+        if s == "":
+            return 0
+        if not re.fullmatch(r"\d+", s):
+            raise ValueError()
+        iv = int(s)
+    else:
+        raise ValueError()
+    if iv < 0:
+        raise ValueError()
+    return iv
+
+
+def validate_transfer_rules(
+    edges: Sequence[Edge],
+    raw_rules,
+    enabled: bool,
+) -> Tuple[Dict[FrozenSet[int], Optional[int]], Tuple[TransferRule, ...]]:
+    """Parse the unordered transfer rules.
+
+    Blank rows are ignored; blank cost means zero cost.  A cost of the
+    forbidden sentinel (string ``x``/``禁行`` or boolean ``true`` field
+    ``forbidden``) blocks the transfer.  Returns (cost map, cleaned rules),
+    where the map value is None for forbidden pairs.
+    """
+    id_to_index = {e.eid: e.index for e in edges}
+
+    def loc(i, *fields):
+        return [{"field": "transfers", "row": i, "sub": f} for f in fields]
+
+    if not isinstance(raw_rules, list):
+        raw_rules = []
+    if enabled and len(edges) > 16:
+        raise AuditError(
+            f"转接耗时模式下管段数量为 {len(edges)}，不能超过 16",
+            ("edges",),
+            [{"field": "edges"}],
+        )
+
+    cost_map: Dict[FrozenSet[int], Optional[int]] = {}
+    cleaned: List[TransferRule] = []
+    seen_pairs: Dict[FrozenSet[int], int] = {}
+
+    for i, rr in enumerate(raw_rules):
+        if not isinstance(rr, dict):
+            continue
+        a = str(rr.get("edgeA", "") or "").strip()
+        b = str(rr.get("edgeB", "") or "").strip()
+        if not a and not b:
+            continue  # blank row
+
+        if not a or not b:
+            raise AuditError(
+                f"第 {i + 1} 条转接规则必须同时指定两条管段",
+                ("transfers",),
+                loc(i, "edgeA", "edgeB"),
+            )
+        if a not in id_to_index:
+            raise AuditError(
+                f"转接规则引用了不存在的管段 {a!r}",
+                ("transfers",),
+                loc(i, "edgeA"),
+            )
+        if b not in id_to_index:
+            raise AuditError(
+                f"转接规则引用了不存在的管段 {b!r}",
+                ("transfers",),
+                loc(i, "edgeB"),
+            )
+        ia, ib = id_to_index[a], id_to_index[b]
+        if ia == ib:
+            raise AuditError(
+                f"转接规则 {a!r} 与自身配对：只能填写同一节点处两条不同管段"
+                "（同一条管段原路返回始终零耗时）",
+                ("transfers",),
+                loc(i, "edgeA", "edgeB"),
+            )
+        ea, eb = edges[ia], edges[ib]
+        shared = {ea.u, ea.v} & {eb.u, eb.v}
+        if not shared:
+            raise AuditError(
+                f"管段 {ea.eid} 与 {eb.eid} 不相邻（没有公共节点），无法在此转接",
+                ("transfers",),
+                loc(i, "edgeA", "edgeB"),
+            )
+
+        forbidden = rr.get("forbidden", False)
+        raw_cost = rr.get("cost", "")
+        if isinstance(forbidden, str):
+            forbidden = forbidden.strip().lower() in ("1", "true", "yes", "禁行", "x")
+        raw_s = raw_cost.strip() if isinstance(raw_cost, str) else raw_cost
+        is_block_token = isinstance(raw_s, str) and raw_s in ("x", "X", "禁", "禁行", "-", "×")
+
+        if forbidden is True or is_block_token:
+            cost: Optional[int] = None
+        else:
+            try:
+                cost = _as_nonneg_int(raw_cost)
+            except ValueError:
+                raise AuditError(
+                    f"转接 {ea.eid}↔{eb.eid} 的耗时必须为非负整数，或填写“禁行”",
+                    ("transfers",),
+                    loc(i, "cost"),
+                )
+
+        pair = frozenset((ia, ib))
+        if pair in seen_pairs:
+            raise AuditError(
+                f"管段 {ea.eid} 与 {eb.eid} 的转接规则重复",
+                ("transfers",),
+                loc(i, "edgeA")
+                + [{"field": "transfers", "row": seen_pairs[pair], "sub": "edgeA"}],
+            )
+        seen_pairs[pair] = i
+        cost_map[pair] = cost
+        cleaned.append(
+            TransferRule(edge_a=ia, edge_b=ib, cost=cost, row=i)
+        )
+
+    return cost_map, tuple(cleaned)
 
 
 # ---------------------------------------------------------------------------
@@ -611,4 +797,228 @@ def audit(
         classification=classification,
         multiplicity=multiplicity,
         route=tuple(route),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Transfer-time mode: shortest covering closed walk in the directed line graph
+# ---------------------------------------------------------------------------
+
+
+def audit_transfer(
+    nodes: Sequence[str],
+    raw_edges: Sequence[dict],
+    start: Optional[str],
+    raw_rules: Sequence[dict],
+) -> TransferResult:
+    """Global optimum over closed walks that may reuse any pipe.
+
+    The ordinary minimum-augmentation machinery is deliberately not used:
+    routing is solved directly in the walk space via layered Dijkstra on
+    (covered-edge mask, current directed dart).
+    """
+    nodes, edges = validate_input(nodes, raw_edges, start)
+    m = len(edges)
+    if m > 16:
+        raise AuditError(
+            f"转接耗时模式下管段数量为 {m}，不能超过 16",
+            ("edges",),
+            [{"field": "edges"}],
+        )
+
+    adj = adjacency(nodes, edges)
+    comps = connected_components(nodes, adj)
+    if len(comps) > 1:
+        raise AuditError(
+            "管网不连通，存在多个连通分量："
+            + "；".join("{" + ",".join(c) + "}" for c in comps),
+            ("edges", "nodes"),
+            [{"field": "edges"}],
+        )
+
+    cost_map, rules = validate_transfer_rules(edges, raw_rules, True)
+
+    nidx = {n: i for i, n in enumerate(nodes)}
+    start_i = nidx[start]
+    D = 2 * m
+
+    # Dart d: edge d>>1 traversed u->v when d even, v->u when d odd.
+    dtail = [0] * D
+    dhead = [0] * D
+    dlen = [0] * D
+    out_darts: List[List[int]] = [[] for _ in nodes]
+    for i, e in enumerate(edges):
+        u, v = nidx[e.u], nidx[e.v]
+        dtail[2 * i], dhead[2 * i], dlen[2 * i] = u, v, e.length
+        dtail[2 * i + 1], dhead[2 * i + 1], dlen[2 * i + 1] = v, u, e.length
+        out_darts[u].append(2 * i)
+        out_darts[v].append(2 * i + 1)
+    for lst in out_darts:
+        lst.sort()
+
+    # Successors of a dart arriving at a node: reverse along the same edge is
+    # always free; every other incident edge pays its transfer rule (unset
+    # pairs cost zero; forbidden pairs are absent).
+    succ: List[Tuple[Tuple[int, int], ...]] = [()] * D
+    for d in range(D):
+        nxt = []
+        for d2 in out_darts[dhead[d]]:
+            if d2 == (d ^ 1):
+                nxt.append((d2, 0))
+                continue
+            c = cost_map.get(frozenset((d >> 1, d2 >> 1)), 0)
+            if c is None:
+                continue
+            nxt.append((d2, c))
+        succ[d] = tuple(sorted(nxt))
+
+    full = (1 << m) - 1
+    nstates = (1 << m) * D
+    dist = [INF] * nstates
+    counts = [0] * nstates
+    settled = bytearray(nstates)
+
+    heap = []
+    for d in out_darts[start_i]:
+        sid = (1 << (d >> 1)) * D + d
+        dist[sid] = dlen[d]
+        counts[sid] = 1  # one first move per dart
+        heapq.heappush(heap, (dlen[d], sid))
+
+    # Pop-time relaxation: every transition weighs at least the entered pipe
+    # length (>= 1), so all predecessors of a state are settled before it and
+    # its shortest-path count is final when it is popped.
+    while heap:
+        du, sid = heapq.heappop(heap)
+        if du != dist[sid] or settled[sid]:
+            continue
+        settled[sid] = 1
+        mask, d = divmod(sid, D)
+        for d2, tc in succ[d]:
+            nmask = mask | (1 << (d2 >> 1))
+            nsid = nmask * D + d2
+            nd = du + tc + dlen[d2]
+            if nd < dist[nsid]:
+                dist[nsid] = nd
+                counts[nsid] = counts[sid]
+                heapq.heappush(heap, (nd, nsid))
+            elif nd == dist[nsid]:
+                counts[nsid] += counts[sid]
+
+    goal_sids = [
+        full * D + d for d in range(D) if dhead[d] == start_i
+    ]
+    best = min((dist[g] for g in goal_sids), default=INF)
+    if best >= INF:
+        raise AuditError(
+            "按当前禁行规则，不存在能够覆盖全部管段并返回检修口的可行闭合行走"
+            "（无可行闭游）",
+            ("transfers",),
+            [{"field": "transfers"}],
+        )
+    optimal_goals = [g for g in goal_sids if dist[g] == best]
+    optimal_count = sum(counts[g] for g in optimal_goals)
+
+    # Mark every state that can still reach an optimal goal on a tight edge.
+    # A state may have several equally tight predecessors (the single stored
+    # predecessor would miss branches), so propagate backwards through ALL of
+    # them.  Predecessors of dart d are the darts arriving at d's tail; the
+    # bit of d's edge was either already covered or gets newly added.
+    rev: List[Tuple[Tuple[int, int], ...]] = [()] * D
+    for d in range(D):
+        pre = []
+        w = dtail[d]
+        for x in out_darts[w]:
+            d1 = x ^ 1  # reverse: a dart leaving w becomes one arriving at w
+            if d1 == (d ^ 1):
+                pre.append((d1, 0))
+                continue
+            c = cost_map.get(frozenset((d1 >> 1, d >> 1)), 0)
+            if c is None:
+                continue
+            pre.append((d1, c))
+        rev[d] = tuple(pre)
+
+    tight = bytearray(nstates)
+    stack = list(optimal_goals)
+    for g in optimal_goals:
+        tight[g] = 1
+    dbit = [1 << (d >> 1) for d in range(D)]
+    while stack:
+        cur = stack.pop()
+        mask, d = divmod(cur, D)
+        bit = dbit[d]
+        pre_masks = (mask, mask ^ bit) if (mask & bit) else (mask,)
+        for d1, tc in rev[d]:
+            for pmask in pre_masks:  # edge d repeated vs newly used
+                p = pmask * D + d1
+                if not tight[p] and dist[p] + tc + dlen[d] == dist[cur]:
+                    tight[p] = 1
+                    stack.append(p)
+
+    seed_states = [(1 << (d >> 1)) * D + d for d in out_darts[start_i]]
+    cur = min((sid for sid in seed_states if tight[sid]), key=lambda s: s % D)
+
+    # Canonical walk: at every state take the smallest dart (edge identifier
+    # order, then u->v before v->u) that keeps a tight continuation.  Because
+    # successor darts are distinct, the first dart alone adjudicates the
+    # lexicographic (identifier, direction) sequence -- no suffix ties exist.
+    dart_walk: List[int] = []
+    while True:
+        mask, d = divmod(cur, D)
+        dart_walk.append(d)
+        if mask == full and dhead[d] == start_i:
+            break
+        chosen = None
+        for d2, tc in succ[d]:
+            nsid = (mask | (1 << (d2 >> 1))) * D + d2
+            if tight[nsid] and dist[cur] + tc + dlen[d2] == dist[nsid]:
+                chosen = (d2, nsid, tc)
+                break
+        if chosen is None:  # pragma: no cover - defensive, tight guarantees it
+            raise AuditError("规范路线重建失败", ("transfers",))
+        cur = chosen[1]
+
+    steps: List[TransferStep] = []
+    for k, dd in enumerate(dart_walk):
+        i = dd >> 1
+        e = edges[i]
+        frm, to = (e.u, e.v) if (dd & 1) == 0 else (e.v, e.u)
+        if k == 0:
+            tc, pair = 0, None
+        else:
+            pdd = dart_walk[k - 1]
+            if dd == (pdd ^ 1):
+                tc, pair = 0, None  # free reversal along the same pipe
+            else:
+                pi = pdd >> 1
+                tc = cost_map.get(frozenset((pi, i)), 0)
+                pair = (pi, i) if pi < i else (i, pi)
+        steps.append(
+            TransferStep(
+                edge_index=i,
+                edge_id=e.eid,
+                frm=frm,
+                to=to,
+                length=e.length,
+                transfer_cost=tc,
+                rule=pair,
+            )
+        )
+
+    walking_length = sum(dlen[d] for d in dart_walk)
+    transfer_time = sum(st.transfer_cost for st in steps)
+    if walking_length + transfer_time != best:  # pragma: no cover - defensive
+        raise AuditError("转接路线核算不一致", ("transfers",))
+
+    return TransferResult(
+        nodes=nodes,
+        edges=edges,
+        start=start,
+        rules=rules,
+        total_length=walking_length,
+        transfer_time=transfer_time,
+        total_time=best,
+        optimal_count=optimal_count,
+        route=tuple(steps),
     )
