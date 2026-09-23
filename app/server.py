@@ -5,10 +5,11 @@ from __future__ import annotations
 import os
 from typing import Any, Dict
 
-from .solver import AuditError, Edge, RouteStep, audit
+from .solver import AuditError, Edge, audit
 
 
 def _serialize(nodes, edges: list[Edge], result) -> Dict[str, Any]:
+    transfer_mode = result.transfer_mode
     edge_objs = [
         {
             "id": e.eid,
@@ -16,8 +17,11 @@ def _serialize(nodes, edges: list[Edge], result) -> Dict[str, Any]:
             "v": e.v,
             "length": e.length,
             "index": e.index,
-            "classification": result.classification[e.index],
-            "duplicated": e.index in result.canonical_set,
+            "classification": result.classification.get(e.index, ""),
+            "duplicated": (
+                result.multiplicity[e.index] > 1 if transfer_mode
+                else e.index in result.canonical_set
+            ),
             "copies": result.multiplicity[e.index],
         }
         for e in edges
@@ -31,6 +35,10 @@ def _serialize(nodes, edges: list[Edge], result) -> Dict[str, Any]:
             "to": st.to,
             "length": st.length,
             "copy": st.duplicate_no,
+            "transfer": st.transfer,
+            "ruleRef": (
+                [st.rule_key[0], st.rule_key[1]] if st.rule_key else None
+            ),
         }
         for i, st in enumerate(result.route)
     ]
@@ -39,8 +47,9 @@ def _serialize(nodes, edges: list[Edge], result) -> Dict[str, Any]:
     for i, st in enumerate(result.route):
         positions[st.edge_index].append(i + 1)
 
-    return {
+    payload: Dict[str, Any] = {
         "ok": True,
+        "mode": "transfer" if transfer_mode else "normal",
         "nodes": nodes,
         "edges": edge_objs,
         "start": result.start,
@@ -57,18 +66,46 @@ def _serialize(nodes, edges: list[Edge], result) -> Dict[str, Any]:
         "eulerian": result.is_eulerian,
     }
 
+    if transfer_mode:
+        rule_objs = []
+        for rule in result.rules:
+            pair = tuple(sorted((rule.edge_a, rule.edge_b)))
+            hits = result.rule_hits.get((rule.node, pair[0], pair[1]), ())
+            rule_objs.append(
+                {
+                    "ref": rule.row,
+                    "node": rule.node,
+                    "edgeA": pair[0],
+                    "edgeB": pair[1],
+                    "cost": rule.cost,  # null == forbidden
+                    "forbidden": rule.cost is None,
+                    "positions": list(hits),
+                }
+            )
+        payload.update(
+            {
+                "walkLength": result.walk_length,
+                "transferCost": result.transfer_cost,
+                "totalTime": result.walk_length + result.transfer_cost,
+                "rules": rule_objs,
+            }
+        )
+    return payload
+
 
 def run_audit(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Pure logic entry: validate + audit, return a response dict."""
     nodes = payload.get("nodes", [])
     edges = payload.get("edges", [])
     start = payload.get("start")
+    transfer_mode = bool(payload.get("transferMode", False))
+    rules = payload.get("rules", [])
     if not isinstance(nodes, list):
         nodes = []
     if not isinstance(edges, list):
         edges = []
     try:
-        result = audit(nodes, edges, start)
+        result = audit(nodes, edges, start, transfer_mode, rules)
     except AuditError as exc:
         return {
             "ok": False,

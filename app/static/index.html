@@ -83,6 +83,18 @@
   .legend i { display:inline-block; width:18px; height:3px; vertical-align:middle; margin-right:4px; border-radius:2px;}
   .hint { color:var(--muted); font-size:12px; margin-top:6px;}
   .scrollx { overflow-x:auto;}
+  .modebox { display:flex; gap:6px; margin-top:12px; background:var(--panel2); border:1px solid var(--line);
+             border-radius:8px; padding:4px;}
+  .modebox button { flex:1; background:transparent; border:none; color:var(--muted); border-radius:6px;
+                    padding:7px 4px; cursor:pointer; font-size:13px; font-weight:600;}
+  .modebox button.on { background:var(--accent); color:#08131f;}
+  #rulesBlock { display:none; margin-top:14px;}
+  .chip.rule { font-family:ui-monospace,Menlo,Consolas,monospace;}
+  .chip.rule.forbidden { border-color:var(--req); color:#ffb3b3;}
+  .chip.rule.sel { outline:2px solid var(--ok);}
+  .rstep .tr { color:var(--ok); font-size:11px; border:1px solid var(--ok); border-radius:10px; padding:0 7px;}
+  .rstep.hlr { background:rgba(55,211,155,.16); border-color:var(--ok);}
+  .rstep .dir { color:var(--muted); font-size:11px;}
 </style>
 </head>
 <body>
@@ -112,6 +124,24 @@
       <button class="ghost" id="addEdge" type="button">+ 管段</button>
     </div>
 
+    <div class="modebox" role="tablist">
+      <button type="button" id="modeNormal" class="on">普通模式（最少增程）</button>
+      <button type="button" id="modeTransfer">转接耗时模式</button>
+    </div>
+
+    <div id="rulesBlock">
+      <table class="grid">
+        <thead><tr><th style="width:70px">节点</th><th style="width:74px">管段一</th>
+          <th style="width:74px">管段二</th><th style="width:86px">耗时/禁行</th><th></th></tr></thead>
+        <tbody id="ruleRows"></tbody>
+      </table>
+      <div class="btns">
+        <button class="ghost" id="addRule" type="button">+ 转接规则</button>
+      </div>
+      <div class="hint">同一节点处两条<b>无序</b>管段的转接耗时：非负整数，或填 <code>禁行</code>/<code>-1</code>；
+        不填视为 0 耗时。平行管段按标识区分。启用时管段不超过 16 条。</div>
+    </div>
+
     <div class="toolbar">
       <label for="startSel">检修口（起点/终点）</label>
       <select id="startSel"></select>
@@ -128,25 +158,35 @@
     <h2>② 审计结果与管网图</h2>
     <div id="summary" style="display:none">
       <div class="stats">
-        <div class="stat"><div class="k">原管网总长度</div><div class="v" id="sTotal"></div></div>
-        <div class="stat"><div class="k">最小增加长度</div><div class="v" id="sAdded"></div></div>
-        <div class="stat"><div class="k">同优重复集合数量</div><div class="v" id="sCount"></div></div>
-        <div class="stat"><div class="k">路线总长度</div><div class="v" id="sRoute"></div></div>
+        <div class="stat"><div class="k" id="k1">原管网总长度</div><div class="v" id="sTotal"></div></div>
+        <div class="stat"><div class="k" id="k2">最小增加长度</div><div class="v" id="sAdded"></div></div>
+        <div class="stat"><div class="k" id="k3">同优重复集合数量</div><div class="v" id="sCount"></div></div>
+        <div class="stat"><div class="k" id="k4">路线总长度</div><div class="v" id="sRoute"></div></div>
       </div>
-      <div style="margin-top:10px">
+      <div style="margin-top:10px" id="normalSummary">
         <div class="k" style="color:var(--muted);font-size:12px">规范重复边（按标识顺序的 0 优先位向量）</div>
         <div class="vector" id="sVector" style="margin-top:3px"></div>
         <div class="chips" id="sChips"></div>
         <div class="hint" id="sOdd"></div>
       </div>
+      <div style="margin-top:10px; display:none" id="transferSummary">
+        <div class="k" style="color:var(--muted);font-size:12px">转接规则（点击高亮路线中全部命中位置；禁行规则无命中）</div>
+        <div class="chips" id="sRules" style="margin-top:4px"></div>
+        <div class="hint" id="sCanon"></div>
+      </div>
     </div>
     <svg id="graph" viewBox="0 0 800 520" preserveAspectRatio="xMidYMid meet"></svg>
-    <div class="legend">
+    <div class="legend" id="legendNormal">
       <span><i style="background:var(--req)"></i>必重复</span>
       <span><i style="background:var(--opt)"></i>可重复</span>
       <span><i style="background:var(--never)"></i>从不重复</span>
       <span><i style="background:var(--ok)"></i>检修口</span>
       <span><i style="background:var(--opt);height:8px;width:8px;border-radius:50%"></i>奇度节点</span>
+    </div>
+    <div class="legend" id="legendTransfer" style="display:none">
+      <span><i style="background:var(--never)"></i>管段（粗线为规范路线重复经过）</span>
+      <span><i style="background:var(--ok)"></i>检修口</span>
+      <span><i style="background:var(--ok);height:10px;width:10px;border-radius:50%"></i>路线中的绿色步为命中所选转接规则</span>
     </div>
     <div class="hint">点选图中管段或上方标签，可在右侧路线中高亮它的全部经过位置；再次点击取消。</div>
   </div>
@@ -162,9 +202,11 @@
 <script>
 "use strict";
 /* ---------------- state (persisted in inputs across failures) ---------- */
-let nodeCount = 0, edgeCount = 0;
+let nodeCount = 0, edgeCount = 0, ruleCount = 0;
 let lastResult = null;
 let selectedEdge = null;
+let selectedRule = null;
+let transferMode = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -197,6 +239,7 @@ function refreshNodeSelects() {
   const prevStart = ss.value;
   ss.innerHTML = nodes.filter(Boolean).map(n => `<option>${escapeAttr(n)}</option>`).join("");
   if (nodes.filter(Boolean).includes(prevStart)) ss.value = prevStart;
+  refreshRuleSelects();
 }
 
 function addEdgeRow(e = {}) {
@@ -208,12 +251,47 @@ function addEdgeRow(e = {}) {
     `<td><select class="ep-b"></select></td>` +
     `<td><input class="ep-len" type="number" min="1" step="1" style="text-align:right" value="${e.length ?? ""}"></td>` +
     `<td><button class="row-del" type="button">✕</button></td>`;
-  tr.querySelector(".row-del").onclick = () => tr.remove();
+  tr.querySelector(".row-del").onclick = () => { tr.remove(); refreshRuleSelects(); };
+  tr.querySelector(".ep-id").addEventListener("input", refreshRuleSelects);
   $("edgeRows").appendChild(tr);
   refreshNodeSelects();
+  refreshRuleSelects();
   if (e.u) tr.querySelector(".ep-a").value = e.u;
   if (e.v) tr.querySelector(".ep-b").value = e.v;
   edgeCount++;
+}
+
+function addRuleRow(r = {}) {
+  const tr = document.createElement("tr");
+  tr.dataset.idx = ruleCount;
+  tr.innerHTML =
+    `<td><select class="r-node"></select></td>` +
+    `<td><select class="r-a"></select></td>` +
+    `<td><select class="r-b"></select></td>` +
+    `<td><input class="r-cost" maxlength="10" placeholder="0" value="${escapeAttr(r.cost ?? "")}"></td>` +
+    `<td><button class="row-del" type="button">✕</button></td>`;
+  tr.querySelector(".row-del").onclick = () => tr.remove();
+  $("ruleRows").appendChild(tr);
+  refreshRuleSelects();
+  if (r.node) tr.querySelector(".r-node").value = r.node;
+  if (r.edgeA) tr.querySelector(".r-a").value = r.edgeA;
+  if (r.edgeB) tr.querySelector(".r-b").value = r.edgeB;
+  ruleCount++;
+}
+
+function refreshRuleSelects() {
+  const nodes = [...document.querySelectorAll(".node-in")].map(i => i.value.trim()).filter(Boolean);
+  const ids = [...document.querySelectorAll(".ep-id")].map(i => i.value.trim()).filter(Boolean);
+  document.querySelectorAll("#ruleRows tr").forEach(tr => {
+    [".r-node", ".r-a", ".r-b"].forEach((cls, ci) => {
+      const sel = tr.querySelector(cls);
+      const prev = sel.value;
+      const opts = ci === 0 ? nodes : ids;
+      sel.innerHTML = `<option value=""></option>` +
+        opts.map(o => `<option>${escapeAttr(o)}</option>`).join("");
+      if (opts.includes(prev)) sel.value = prev;
+    });
+  });
 }
 
 function escapeAttr(s){ return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
@@ -235,16 +313,23 @@ function markBad(locations) {
       } else document.querySelectorAll(".ep-id,.ep-a,.ep-b,.ep-len").forEach(el => el.classList.add("bad"));
     } else if (loc.field === "start") {
       $("startSel").classList.add("bad");
+    } else if (loc.field === "rules") {
+      const rows = document.querySelectorAll("#ruleRows tr");
+      if (loc.row != null && rows[loc.row]) {
+        rows[loc.row].querySelectorAll("input,select").forEach(el => el.classList.add("bad"));
+      } else document.querySelectorAll(".r-node,.r-a,.r-b,.r-cost").forEach(el => el.classList.add("bad"));
     }
   });
 }
 
 function clearConclusion() {
-  lastResult = null; selectedEdge = null;
+  lastResult = null; selectedEdge = null; selectedRule = null;
   $("summary").style.display = "none";
   $("graph").innerHTML = "";
   $("route").innerHTML = "";
   $("routeEmpty").style.display = "";
+  $("legendNormal").style.display = transferMode ? "none" : "";
+  $("legendTransfer").style.display = transferMode ? "" : "none";
 }
 
 /* ---------------- audit call ------------------------------------------- */
@@ -260,6 +345,13 @@ async function doAudit() {
       length: tr.querySelector(".ep-len").value,
     })),
     start: $("startSel").value,
+    transferMode: transferMode,
+    rules: transferMode ? [...document.querySelectorAll("#ruleRows tr")].map(tr => ({
+      node: tr.querySelector(".r-node").value,
+      edgeA: tr.querySelector(".r-a").value,
+      edgeB: tr.querySelector(".r-b").value,
+      cost: tr.querySelector(".r-cost").value,
+    })) : [],
   };
   let resp;
   try {
@@ -281,6 +373,8 @@ async function doAudit() {
     return;
   }
   lastResult = resp;
+  $("legendNormal").style.display = resp.mode === "transfer" ? "none" : "";
+  $("legendTransfer").style.display = resp.mode === "transfer" ? "" : "none";
   renderSummary(resp);
   renderGraph(resp);
   renderRoute(resp);
@@ -291,7 +385,9 @@ function showError(msg, locs) {
   let where = "";
   if (locs && locs.length) {
     where = "<div class='locs'>定位：" + locs.map(l => {
-      const name = l.field === "nodes" ? "节点表" : l.field === "edges" ? "管段表" : "检修口";
+      const name = l.field === "nodes" ? "节点表"
+        : l.field === "edges" ? "管段表"
+        : l.field === "rules" ? "转接规则表" : "检修口";
       return l.row != null ? `${name} 第 ${l.row + 1} 行` : name;
     }).join("；") + "</div>";
   }
@@ -302,6 +398,45 @@ function showError(msg, locs) {
 /* ---------------- summary ----------------------------------------------- */
 function renderSummary(r) {
   $("summary").style.display = "";
+  const tm = r.mode === "transfer";
+  $("normalSummary").style.display = tm ? "none" : "";
+  $("transferSummary").style.display = tm ? "" : "none";
+  if (tm) {
+    $("k1").textContent = "行走长度";
+    $("k2").textContent = "转接耗时";
+    $("k3").textContent = "最优路线数";
+    $("k4").textContent = "总耗时（长+转接）";
+    $("sTotal").textContent = r.walkLength;
+    $("sAdded").textContent = r.transferCost;
+    $("sCount").textContent = r.optimalCount;
+    $("sRoute").textContent = r.totalTime;
+
+    const chips = $("sRules");
+    chips.innerHTML = "";
+    (r.rules || []).forEach(rule => {
+      const c = document.createElement("span");
+      c.className = "chip rule" + (rule.forbidden ? " forbidden" : "");
+      c.dataset.ruleRef = rule.ref;
+      c.textContent = `${rule.node}:${rule.edgeA}↔${rule.edgeB} · ` +
+        (rule.forbidden ? "禁行" : rule.cost) +
+        ` · ${rule.positions.length} 次`;
+      c.title = rule.positions.length
+        ? `命中步序：${rule.positions.join(", ")}`
+        : "规范路线未使用该转接（禁行规则必然不出现）";
+      c.onclick = () => selectRule(selectedRule === rule.ref ? null : rule.ref);
+      chips.appendChild(c);
+    });
+    $("sCanon").textContent =
+      "在可重复经过管段的闭合行走空间中全局求优（未先固定增程集合）；"
+      + "规范步骤按管段标识与方向序列的字典序裁决。行走长度 "
+      + r.walkLength + " = 原管网 " + r.totalLength + " + 重复 " + r.addedLength + "。";
+    return;
+  }
+
+  $("k1").textContent = "原管网总长度";
+  $("k2").textContent = "最小增加长度";
+  $("k3").textContent = "同优重复集合数量";
+  $("k4").textContent = "路线总长度";
   $("sTotal").textContent = r.totalLength;
   $("sAdded").textContent = r.addedLength + (r.eulerian ? "（欧拉管网，零增程）" : "");
   $("sCount").textContent = r.optimalCount;
@@ -401,7 +536,7 @@ function renderGraph(r) {
         selectEdge(selectedEdge === e.index ? null : e.index));
       svg.appendChild(line); svg.appendChild(hit);
       const lab = mk("text", { x: cx, y: cy - 4, class: "elabel", "text-anchor":"middle" });
-      lab.textContent = e.id + (e.duplicated ? " ×2" : "");
+      lab.textContent = e.id + (e.duplicated ? ` ×${e.copies}` : "");
       lab.dataset.edgeIndex = e.index;
       svg.appendChild(lab);
     });
@@ -426,30 +561,53 @@ function renderRoute(r) {
   $("routeEmpty").style.display = "none";
   const box = $("route");
   box.innerHTML = "";
+  const tm = r.mode === "transfer";
+  // index rule positions by step seq: ruleRef -> set of step numbers
+  const ruleAt = {};
+  if (tm) (r.rules || []).forEach(rule => {
+    rule.positions.forEach(p => { ruleAt[p] = rule.ref; });
+  });
   r.route.forEach((st, i) => {
     const div = document.createElement("div");
     div.className = "rstep";
     div.dataset.edgeIndex = st.edgeIndex;
+    div.dataset.seq = st.seq;
+    if (tm && ruleAt[st.seq] != null) div.dataset.ruleRef = ruleAt[st.seq];
+    const trHtml = tm
+      ? `<span class="tr" title="进入该步时支付的转接耗时">转接 ${st.transfer}</span>`
+      : `<span class="copy">第 ${st.copy} 副本</span>`;
+    const dir = tm ? `<span class="dir">${st.ruleRef ? st.ruleRef[0] + "↔" + st.ruleRef[1] : "（出发/掉头）"}</span>` : "";
     div.innerHTML =
       `<span class="seq">${st.seq}.</span>` +
       `<span class="eid">${escapeAttr(st.edgeId)}</span>` +
       `<span>${escapeAttr(st.from)} → ${escapeAttr(st.to)}</span>` +
-      `<span class="copy">第 ${st.copy} 副本</span>` +
+      dir +
+      trHtml +
       `<span class="len">${st.length}</span>`;
     box.appendChild(div);
   });
   selectedEdge = null;
+  selectedRule = null;
+}
+
+function _clearHighlights() {
+  document.querySelectorAll(".rstep").forEach(el =>
+    el.classList.remove("hl", "hlr"));
 }
 
 function selectEdge(index) {
   selectedEdge = index;
+  selectedRule = null;
   document.querySelectorAll(".edge-line").forEach(el =>
     el.classList.toggle("sel", Number(el.dataset.edgeIndex) === index));
   document.querySelectorAll(".elabel").forEach(el =>
     el.classList.toggle("sel", Number(el.dataset.edgeIndex) === index));
-  document.querySelectorAll(".chip").forEach(el =>
+  document.querySelectorAll(".chip:not(.rule)").forEach(el =>
     el.classList.toggle("sel", Number(el.dataset.edgeIndex) === index));
+  document.querySelectorAll(".chip.rule").forEach(el => el.classList.remove("sel"));
   let firstHl = null;
+  _clearHighlights();
+  if (index == null) return;
   document.querySelectorAll(".rstep").forEach(el => {
     const hl = Number(el.dataset.edgeIndex) === index;
     el.classList.toggle("hl", hl);
@@ -458,27 +616,72 @@ function selectEdge(index) {
   if (firstHl) firstHl.scrollIntoView({block:"center", behavior:"smooth"});
 }
 
-/* ---------------- sample & init ------------------------------------------ */
+function selectRule(ref) {
+  selectedRule = ref;
+  selectedEdge = null;
+  document.querySelectorAll(".edge-line,.elabel").forEach(el => el.classList.remove("sel"));
+  document.querySelectorAll(".chip:not(.rule)").forEach(el => el.classList.remove("sel"));
+  _clearHighlights();
+  document.querySelectorAll(".chip.rule").forEach(el =>
+    el.classList.toggle("sel", Number(el.dataset.ruleRef) === ref));
+  if (ref == null) return;
+  let firstHl = null;
+  document.querySelectorAll(".rstep").forEach(el => {
+    const hl = Number(el.dataset.ruleRef) === ref;
+    el.classList.toggle("hlr", hl);
+    if (hl && !firstHl) firstHl = el;
+  });
+  if (firstHl) firstHl.scrollIntoView({block:"center", behavior:"smooth"});
+}
+
+/* ---------------- mode switch & samples --------------------------------- */
+function setMode(tm) {
+  transferMode = tm;
+  $("modeNormal").classList.toggle("on", !tm);
+  $("modeTransfer").classList.toggle("on", tm);
+  $("rulesBlock").style.display = tm ? "" : "none";
+  $("legendNormal").style.display = tm ? "none" : "";
+  $("legendTransfer").style.display = tm ? "" : "none";
+  if (tm && !document.querySelectorAll("#ruleRows tr").length) addRuleRow();
+  clearConclusion();
+}
+
 function loadSample() {
-  document.querySelectorAll("#nodeRows tr,#edgeRows tr").forEach(t => t.remove());
+  document.querySelectorAll("#nodeRows tr,#edgeRows tr,#ruleRows tr").forEach(t => t.remove());
+  if (transferMode) {
+    // 高耗时绕行示例：B 点 e1↔e2 转接很贵，最优路线掉头绕行
+    ["A", "B", "C", "X"].forEach(n => addNodeRow(n));
+    [["e1", "A", "B", 1], ["e2", "B", "C", 1], ["e3", "C", "A", 1],
+     ["e4", "A", "X", 1], ["e5", "X", "C", 1]]
+      .forEach(([id, u, v, l]) => addEdgeRow({ id, u, v, length: l }));
+    refreshNodeSelects();
+    $("startSel").value = "A";
+    addRuleRow({ node: "B", edgeA: "e1", edgeB: "e2", cost: 100 });
+    addRuleRow({ node: "A", edgeA: "e3", edgeB: "e4", cost: "" });
+    return;
+  }
   // K4 unit graph: 3 distinct optimal sets
-  ["A","B","C","D"].forEach(n => addNodeRow(n));
-  [["e1","A","B",1],["e2","A","C",1],["e3","A","D",1],
-   ["e4","B","C",1],["e5","B","D",1],["e6","C","D",1]]
-    .forEach(([id,u,v,l]) => addEdgeRow({id,u,v,length:l}));
+  ["A", "B", "C", "D"].forEach(n => addNodeRow(n));
+  [["e1", "A", "B", 1], ["e2", "A", "C", 1], ["e3", "A", "D", 1],
+   ["e4", "B", "C", 1], ["e5", "B", "D", 1], ["e6", "C", "D", 1]]
+    .forEach(([id, u, v, l]) => addEdgeRow({ id, u, v, length: l }));
   refreshNodeSelects();
   $("startSel").value = "A";
 }
 
 $("addNode").onclick = () => addNodeRow();
 $("addEdge").onclick = () => addEdgeRow();
+$("addRule").onclick = () => addRuleRow();
 $("auditBtn").onclick = doAudit;
 $("sampleBtn").onclick = loadSample;
+$("modeNormal").onclick = () => setMode(false);
+$("modeTransfer").onclick = () => setMode(true);
 
 // initial blank rows
 addNodeRow(""); addNodeRow("");
 addEdgeRow();
 refreshNodeSelects();
+setMode(false);
 </script>
 </body>
 </html>

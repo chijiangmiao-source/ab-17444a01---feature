@@ -6,6 +6,21 @@ vertices to have even degree, the exact number of optimal duplicate sets, the
 canonical duplicate set (0-preferred bit vector in edge order), per-edge
 classification, and a closed Euler tour for the canonical augmentation.
 
+Two modes
+---------
+Normal mode (``transfer_mode=False``) is the classic Chinese postman problem;
+see the T-join exposition below.
+
+Transfer-time mode (``transfer_mode=True``) additionally accepts, for every
+node, unordered pairs of incident pipes that may be switched between there, a
+non-negative integer switch time or a "forbidden" marker; an unspecified pair
+costs zero.  The optimum is then found directly in the space of closed walks
+that may traverse pipes repeatedly: a walk is a sequence of directed pipe
+traversals, and its objective is the sum of traversed pipe lengths plus every
+adjacent switch time.  The solver never fixes a minimum-augmentation edge set
+first -- a longer walk can be cheaper when a switch is costly.  The mode is
+restricted to at most 16 pipes.
+
 Exact counting without enumeration
 ----------------------------------
 A duplicate set is a T-join: in the subgraph formed by the duplicated edges
@@ -87,6 +102,19 @@ class RouteStep:
     to: str
     length: int
     duplicate_no: int  # which copy of this edge, 1-based, in traversal order
+    transfer: int = 0  # switch time paid when entering this pipe
+    rule_key: Optional[Tuple[str, str]] = None  # ordered edge ids of the rule
+
+
+@dataclass(frozen=True)
+class TransferRule:
+    """A switch rule at one node between two unordered incident pipes."""
+
+    node: str
+    edge_a: str
+    edge_b: str
+    cost: Optional[int]  # None == forbidden
+    row: int  # row index in the request, for error locations
 
 
 @dataclass
@@ -104,6 +132,11 @@ class AuditResult:
     classification: Dict[int, str]  # required | optional | never
     multiplicity: Tuple[int, ...]
     route: Tuple[RouteStep, ...]
+    transfer_mode: bool = False
+    transfer_cost: int = 0
+    walk_length: int = 0
+    rules: Tuple[TransferRule, ...] = ()
+    rule_hits: Dict[Tuple[str, ...], Tuple[int, ...]] = field(default_factory=dict)
 
     @property
     def is_eulerian(self) -> bool:
@@ -129,9 +162,39 @@ def _as_positive_int(value, eid: str) -> int:
     return length
 
 
+def _as_nonneg_cost(value, where: str):
+    """Parse a transfer cell: blank/missing -> 0, -1/'禁行' -> forbidden."""
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        raise AuditError(f"{where}耗时必须为非负整数或禁行", ("rules",))
+    if isinstance(value, int):
+        if value == -1:
+            return None
+        cost = value
+    elif isinstance(value, str):
+        s = value.strip()
+        if s == "":
+            return 0
+        if s in ("-1", "禁行", "禁止", "forbidden", "x", "X"):
+            return None
+        if not re.fullmatch(r"\d+", s):
+            raise AuditError(f"{where}耗时必须为非负整数或禁行", ("rules",))
+        cost = int(s)
+    else:
+        raise AuditError(f"{where}耗时必须为非负整数或禁行", ("rules",))
+    if cost < 0:
+        raise AuditError(f"{where}耗时必须为非负整数或禁行", ("rules",))
+    return cost
+
+
 def validate_input(
-    nodes: Sequence[str], raw_edges: Sequence[dict], start: Optional[str]
-) -> Tuple[List[str], List[Edge]]:
+    nodes: Sequence[str],
+    raw_edges: Sequence[dict],
+    start: Optional[str],
+    transfer_mode: bool = False,
+    raw_rules=None,
+):
     clean_nodes: List[str] = []
     node_rows: Dict[str, int] = {}
     for i, raw in enumerate(nodes):
@@ -161,9 +224,11 @@ def validate_input(
 
     if not raw_edges:
         raise AuditError("至少需要 1 条管段", ("edges",), [{"field": "edges"}])
-    if len(raw_edges) > 32:
+    edge_limit = 16 if transfer_mode else 32
+    if len(raw_edges) > edge_limit:
         raise AuditError(
-            f"管段数量为 {len(raw_edges)}，不能超过 32",
+            f"管段数量为 {len(raw_edges)}，"
+            + ("转接耗时模式下不能超过 16" if transfer_mode else "不能超过 32"),
             ("edges",),
             [{"field": "edges"}],
         )
@@ -209,6 +274,12 @@ def validate_input(
             )
 
         length = _as_positive_int(re_.get("length", None), eid)
+        if transfer_mode and length > 10**6:
+            raise AuditError(
+                f"转接耗时模式下管段长度不能超过 1000000（管段 {eid}）",
+                ("edges",),
+                loc,
+            )
         edges.append(Edge(eid=eid, u=u, v=v, length=length, index=i))
 
     # The canonical bit vector is ordered by edge *identifier*, so reorder
@@ -228,7 +299,110 @@ def validate_input(
             f"检修口 {start_s!r} 不存在", ("start",), [{"field": "start"}]
         )
 
-    return clean_nodes, edges
+    rules = _validate_rules(
+        raw_rules if transfer_mode else (),
+        edges,
+        node_rows,
+    )
+
+    return clean_nodes, edges, rules
+
+
+def _validate_rules(raw_rules, edges, node_rows) -> Tuple[TransferRule, ...]:
+    """Validate switch rules.
+
+    A rule references one declared node and two distinct existing pipe
+    identifiers that are both incident to that node (they may be parallel
+    pipes).  Unspecified/zero cost is allowed; ``-1`` / "禁行" forbids the
+    switch.  Duplicate rules on the same unordered pair at the same node are
+    rejected.
+    """
+    if raw_rules is None:
+        return ()
+    if not isinstance(raw_rules, (list, tuple)):
+        raise AuditError(
+            "转接规则必须为列表", ("rules",), [{"field": "rules"}]
+        )
+
+    by_id = {e.eid: e for e in edges}
+    seen: Dict[Tuple[str, str, str], int] = {}
+    rules: List[TransferRule] = []
+    for i, rr in enumerate(raw_rules):
+        if not isinstance(rr, dict):
+            raise AuditError(
+                f"第 {i + 1} 条转接规则格式错误",
+                ("rules",),
+                [{"field": "rules", "row": i}],
+            )
+        loc = [{"field": "rules", "row": i}]
+        node = str(rr.get("node", "") or "").strip()
+        ea = str(rr.get("edgeA", rr.get("edge_a", "")) or "").strip()
+        eb = str(rr.get("edgeB", rr.get("edge_b", "")) or "").strip()
+        raw_cost = rr.get("cost", rr.get("time", None))
+        cost_blank = raw_cost is None or (
+            isinstance(raw_cost, str) and raw_cost.strip() == ""
+        )
+        # a wholly empty row is an unused editor row: skip it silently so
+        # request row indices still line up with the editor table rows
+        if not node and not ea and not eb and cost_blank:
+            continue
+        where = f"转接规则第 {i + 1} 行（{ea or '?'}↔{eb or '?'} @ {node or '?'}）"
+
+        if not node:
+            raise AuditError(f"{where} 缺少节点", ("rules",), loc)
+        if node not in node_rows:
+            raise AuditError(
+                f"{where} 引用的节点 {node!r} 不存在", ("rules",), loc
+            )
+        if not ea or not eb:
+            raise AuditError(f"{where} 缺少管段标识", ("rules",), loc)
+        if ea not in by_id:
+            raise AuditError(
+                f"{where} 引用的管段 {ea!r} 不存在", ("rules",), loc
+            )
+        if eb not in by_id:
+            raise AuditError(
+                f"{where} 引用的管段 {eb!r} 不存在", ("rules",), loc
+            )
+        if ea == eb:
+            raise AuditError(
+                f"{where} 的两条管段必须不同", ("rules",), loc
+            )
+        ga, gb = by_id[ea], by_id[eb]
+        incident_a = {ga.u, ga.v}
+        incident_b = {gb.u, gb.v}
+        if node not in incident_a or node not in incident_b:
+            raise AuditError(
+                f"{where} 中管段 {ea} 与 {eb} 未在节点 {node} 相邻，"
+                "转接只能发生在两条管段的公共节点",
+                ("rules",),
+                loc,
+            )
+
+        cost = _as_nonneg_cost(rr.get("cost", rr.get("time", None)), where)
+        key = (node, *sorted((ea, eb)))
+        if key in seen:
+            raise AuditError(
+                f"{where} 与第 {seen[key] + 1} 行规则重复（节点与无序管段对相同）",
+                ("rules",),
+                loc + [{"field": "rules", "row": seen[key]}],
+            )
+        seen[key] = i
+        rules.append(
+            TransferRule(node=node, edge_a=ea, edge_b=eb, cost=cost, row=i)
+        )
+
+    # The layered DP stores costs in signed 64-bit arrays.  An optimal walk
+    # has at most m first visits, each reached after an intra-layer detour of
+    # at most 2m-1 arcs; keeping the unit costs bounded leaves ample margin.
+    for rule in rules:
+        if rule.cost is not None and rule.cost > 10**6:
+            raise AuditError(
+                f"转接耗时不能超过 1000000（第 {rule.row + 1} 行规则）",
+                ("rules",),
+                [{"field": "rules", "row": rule.row}],
+            )
+    return tuple(rules)
 
 
 # ---------------------------------------------------------------------------
@@ -510,9 +684,15 @@ def enumerate_optimal_tjoins(
 
 
 def audit(
-    nodes: Sequence[str], raw_edges: Sequence[dict], start: Optional[str]
+    nodes: Sequence[str],
+    raw_edges: Sequence[dict],
+    start: Optional[str],
+    transfer_mode: bool = False,
+    raw_rules=None,
 ) -> AuditResult:
-    nodes, edges = validate_input(nodes, raw_edges, start)
+    nodes, edges, rules = validate_input(
+        nodes, raw_edges, start, transfer_mode, raw_rules
+    )
     adj = adjacency(nodes, edges)
 
     comps = connected_components(nodes, adj)
@@ -523,6 +703,9 @@ def audit(
             ("edges", "nodes"),
             [{"field": "edges"}],
         )
+
+    if transfer_mode:
+        return audit_transfers(nodes, edges, start, rules, comps)
 
     degree = {n: 0 for n in nodes}
     for e in edges:
@@ -611,4 +794,357 @@ def audit(
         classification=classification,
         multiplicity=multiplicity,
         route=tuple(route),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Transfer-time mode: global optimum directly over closed walks
+# ---------------------------------------------------------------------------
+#
+# A state is one directed pipe traversal d = 2*edge_index + dir (dir 0 is the
+# declared u->v orientation, dir 1 v->u).  An arc d -> d' exists exactly when
+# d ends at the node d' starts at; its weight is
+#
+#     length(pipe(d')) + switch_time(pipe(d), pipe(d') at that node)
+#
+# A closed walk from the maintenance port is a state sequence d1..dt with
+# d1 starting at the port, dt ending at the port, every pipe covered at least
+# once, and total cost = sum of arc weights.  Repeated traversals of covered
+# pipes stay within the same coverage mask; the first traversal of a pipe
+# raises the mask bit.  Positive pipe lengths keep every arc strictly
+# positive, so within one mask layer the closure is solved by a multi-source
+# Dijkstra, and mask layers are processed in numeric order (raising a bit
+# always increases the mask).
+
+
+def _transfer_arc_index(edges: Sequence[Edge], rules: Sequence[TransferRule]):
+    """Precompute switch times keyed by (node, ordered edge-index pair).
+
+    Unspecified distinct-pipe switches (and a U-turn back through the very
+    pipe just traversed) cost zero; forbidden rules carry None.
+    """
+    costs: Dict[Tuple[str, int, int], Optional[int]] = {}
+    idx_by_id = {e.eid: e.index for e in edges}
+    for rule in rules:
+        a, b = idx_by_id[rule.edge_a], idx_by_id[rule.edge_b]
+        costs[(rule.node, min(a, b), max(a, b))] = rule.cost
+    return costs
+
+
+def _switch_cost(costs, node: str, a: int, b: int):
+    if a == b:
+        return 0  # U-turn on the same pipe, always free and allowed
+    return costs.get((node, min(a, b), max(a, b)), 0)
+
+
+def audit_transfers(nodes, edges, start, rules, comps) -> AuditResult:
+    from array import array
+
+    m = len(edges)
+    S = 2 * m
+    nmasks = 1 << m
+    full = nmasks - 1
+    total_length = sum(e.length for e in edges)
+    INF64 = 10**18
+
+    costs = _transfer_arc_index(edges, rules)
+
+    def st_from(d):
+        e = edges[d >> 1]
+        return e.v if (d & 1) else e.u
+
+    def st_to(d):
+        e = edges[d >> 1]
+        return e.u if (d & 1) else e.v
+
+    def st_key(d):
+        # pipe identifier order (edges sorted by id), then u->v before v->u
+        return (d >> 1, d & 1)
+
+    # incident edge indices per node, and the one directed state in which a
+    # pipe leaves a given node
+    incident = {n: [] for n in nodes}
+    for e in edges:
+        incident[e.u].append(e.index)
+        incident[e.v].append(e.index)
+    leaving: Dict[Tuple[int, str], int] = {}
+    for e in edges:
+        leaving[(e.index, e.u)] = 2 * e.index
+        leaving[(e.index, e.v)] = 2 * e.index + 1
+
+    # arcs[d] = list of (next_state, weight); weight is the entered pipe
+    # length plus the switch time at the joining node
+    arcs: List[List[Tuple[int, int]]] = [[] for _ in range(S)]
+    for d in range(S):
+        x = st_to(d)
+        ei = d >> 1
+        for ej in incident[x]:
+            c = _switch_cost(costs, x, ei, ej)
+            if c is None:
+                continue  # forbidden switch
+            arcs[d].append((leaving[(ej, x)], edges[ej].length + c))
+        arcs[d].sort(key=lambda z: st_key(z[0]))
+
+    # reversed arcs (static): rev[u] = [(predecessor d, weight)] for d -> u
+    rev_arcs: List[List[Tuple[int, int]]] = [[] for _ in range(S)]
+    for d, outs in enumerate(arcs):
+        for nd, w in outs:
+            rev_arcs[nd].append((d, w))
+
+    # ------------------------------------------------------------------
+    # Forward pass: best cost / exact number of optimal walks for each
+    # (coverage mask, current directed state).  Intra-layer closure is a
+    # multi-source Dijkstra on the arcs staying on covered pipes; with at
+    # most 32 states a simple O(S^2) selection Dijkstra is fastest.
+    # ------------------------------------------------------------------
+    dist = array("q", [INF64]) * (nmasks * S)
+    cnt = [0] * (nmasks * S)
+
+    def active_states(M):
+        """Both directed states of every pipe covered by mask M."""
+        b = M
+        while b:
+            lb = b & -b
+            ei = lb.bit_length() - 1
+            yield 2 * ei
+            yield 2 * ei + 1
+            b ^= lb
+
+    for e in edges:  # seed: first traversal leaves the maintenance port
+        if e.u == start:
+            p = (1 << e.index) * S + 2 * e.index
+            dist[p] = e.length
+            cnt[p] = 1
+        if e.v == start:
+            p = (1 << e.index) * S + 2 * e.index + 1
+            dist[p] = e.length
+            cnt[p] = 1
+
+    for M in range(1, nmasks):
+        base = M * S
+        active = tuple(active_states(M))
+        done = bytearray(S)
+        for _ in range(len(active)):
+            u = -1
+            best = INF64
+            for d in active:
+                if not done[d] and dist[base + d] < best:
+                    best, u = dist[base + d], d
+            if u < 0:
+                break
+            done[u] = 1
+            du = dist[base + u]
+            cu = cnt[base + u]
+            for nd, w in arcs[u]:
+                if not ((M >> (nd >> 1)) & 1) or done[nd]:
+                    continue
+                p = base + nd
+                v = du + w
+                if v < dist[p]:
+                    dist[p] = v
+                    cnt[p] = cu
+                elif v == dist[p]:
+                    cnt[p] += cu
+
+        # raise coverage onto a pipe traversed for the first time
+        for d in active:
+            if done[d]:  # finalized reachable state
+                du = dist[base + d]
+                ways = cnt[base + d]
+                for nd, w in arcs[d]:
+                    ej = nd >> 1
+                    if (M >> ej) & 1:
+                        continue
+                    p = (M | (1 << ej)) * S + nd
+                    v = du + w
+                    if v < dist[p]:
+                        dist[p] = v
+                        cnt[p] = ways
+                    elif v == dist[p]:
+                        cnt[p] += ways
+
+    fbase = full * S
+    end_states = tuple(d for d in range(S) if st_to(d) == start)
+    finish = [(dist[fbase + d], cnt[fbase + d]) for d in end_states]
+    finish = [t for t in finish if t[0] < INF64]
+    if not finish:
+        raise AuditError(
+            "无可行闭游：当前禁行规则下，无法从检修口出发经过全部管段后返回"
+            "（请检查相关节点处的转接是否被禁行阻断）",
+            ("rules",),
+            [{"field": "rules"}],
+        )
+    optimum = min(w for w, _ in finish)
+    optimal_count = sum(c for w, c in finish if w == optimum)
+
+    # ------------------------------------------------------------------
+    # Backward pass: H[M][d] = cheapest suffix from state d (its pipe just
+    # traversed, coverage M) to a closed finish; bottom-up over masks with
+    # the same intra-layer closure on reversed covered-pipe arcs.
+    # ------------------------------------------------------------------
+    H = array("q", [INF64]) * (nmasks * S)
+    for M in range(full, 0, -1):
+        base = M * S
+        active = tuple(active_states(M))
+        h = [INF64] * S
+        if M == full:
+            for d in end_states:
+                h[d] = 0
+        for d in active:
+            bd = h[d]
+            for nd, w in arcs[d]:
+                ej = nd >> 1
+                if (M >> ej) & 1:
+                    continue
+                hv = H[(M | (1 << ej)) * S + nd]
+                if hv < INF64 and w + hv < bd:
+                    bd = w + hv
+            h[d] = bd
+        if all(h[d] >= INF64 for d in active):
+            continue  # cannot finish from this coverage set
+        # multi-source Dijkstra on reversed intra-layer arcs
+        done = bytearray(S)
+        for _ in range(len(active)):
+            u = -1
+            best = INF64
+            for d in active:
+                if not done[d] and h[d] < best:
+                    best, u = h[d], d
+            if u < 0:
+                break
+            done[u] = 1
+            hu = h[u]
+            for pa, w in rev_arcs[u]:
+                if not ((M >> (pa >> 1)) & 1) or done[pa]:
+                    continue
+                v = hu + w
+                if v < h[pa]:
+                    h[pa] = v
+        for d in active:
+            H[base + d] = h[d]
+
+    # ------------------------------------------------------------------
+    # Canonical walk: at every step the lexicographically smallest next
+    # (pipe id, direction) that still admits an optimal suffix.
+    # ------------------------------------------------------------------
+    first = None
+    first_best = INF64
+    for e in edges:
+        for d in (2 * e.index, 2 * e.index + 1):
+            if st_from(d) != start:
+                continue
+            hv = H[(1 << e.index) * S + d]
+            if hv < INF64 and e.length + hv < first_best:
+                first_best = e.length + hv
+                first = d
+    if first is None or first_best != optimum:
+        raise AuditError(
+            "无可行闭游：当前禁行规则下，无法从检修口出发经过全部管段后返回",
+            ("rules",),
+            [{"field": "rules"}],
+        )
+
+    seq: List[int] = [first]
+    d = first
+    M = 1 << (d >> 1)
+    remaining = H[M * S + d]
+    guard = 0
+    while remaining > 0:
+        guard += 1
+        if guard > nmasks * S:
+            raise AuditError("内部错误：规范路线恢复失败", ("rules",))
+        chosen = None
+        chosen_w = None
+        for nd, w in arcs[d]:
+            ej = nd >> 1
+            M2 = M if (M >> ej) & 1 else M | (1 << ej)
+            hv = H[M2 * S + nd]
+            if hv < INF64 and w + hv == remaining:
+                if chosen is None or st_key(nd) < st_key(chosen):
+                    chosen, chosen_w = nd, w
+        if chosen is None:
+            raise AuditError("内部错误：规范路线恢复失败", ("rules",))
+        seq.append(chosen)
+        M |= 1 << (chosen >> 1)
+        remaining -= chosen_w
+        d = chosen
+
+    # ------------------------------------------------------------------
+    # Assemble steps, totals and per-rule hit positions
+    # ------------------------------------------------------------------
+    steps: List[RouteStep] = []
+    occ = [0] * m
+    walk_length = 0
+    transfer_cost = 0
+    prev = None
+    for d in seq:
+        ei = d >> 1
+        e = edges[ei]
+        frm, to = (e.u, e.v) if not (d & 1) else (e.v, e.u)
+        if prev is None:
+            switch = 0
+        else:
+            for nd, w in arcs[prev]:
+                if nd == d:
+                    switch = w - e.length
+                    break
+            else:  # pragma: no cover - reconstruction guarantees the arc
+                raise AuditError("内部错误：规范路线恢复失败", ("rules",))
+        rkey = (
+            tuple(sorted((edges[prev >> 1].eid, e.eid)))
+            if prev is not None and (prev >> 1) != ei
+            else None
+        )
+        occ[ei] += 1
+        walk_length += e.length
+        transfer_cost += switch
+        steps.append(
+            RouteStep(
+                edge_index=ei,
+                edge_id=e.eid,
+                frm=frm,
+                to=to,
+                length=e.length,
+                duplicate_no=occ[ei],
+                transfer=switch,
+                rule_key=rkey,
+            )
+        )
+        prev = d
+
+    multiplicity = tuple(occ)
+    rule_hits: Dict[Tuple[str, ...], Tuple[int, ...]] = {}
+    for rule in rules:
+        pair = tuple(sorted((rule.edge_a, rule.edge_b)))
+        rule_hits[(rule.node, pair[0], pair[1])] = tuple(
+            i + 1
+            for i, st in enumerate(steps)
+            if st.rule_key == pair and st.frm == rule.node
+        )
+
+    degree = {n: 0 for n in nodes}
+    for e in edges:
+        degree[e.u] += 1
+        degree[e.v] += 1
+    odd = tuple(sorted(n for n in nodes if degree[n] % 2 == 1))
+
+    return AuditResult(
+        nodes=nodes,
+        edges=edges,
+        start=start,
+        odd_vertices=odd,
+        components=tuple(tuple(c) for c in comps),
+        total_length=total_length,
+        added_length=walk_length - total_length,
+        optimal_count=optimal_count,
+        canonical_set=frozenset(),
+        bit_vector="",
+        classification={},
+        multiplicity=multiplicity,
+        route=tuple(steps),
+        transfer_mode=True,
+        transfer_cost=transfer_cost,
+        walk_length=walk_length,
+        rules=rules,
+        rule_hits=rule_hits,
     )

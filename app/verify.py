@@ -58,6 +58,35 @@ BAD = {
     "start": "A",
 }
 
+# Transfer-time mode fixtures ------------------------------------------------
+
+DETOUR_NODES = ["A", "B", "C", "X"]
+DETOUR_EDGES = [
+    {"id": "e1", "u": "A", "v": "B", "length": 1},
+    {"id": "e2", "u": "B", "v": "C", "length": 1},
+    {"id": "e3", "u": "C", "v": "A", "length": 1},
+    {"id": "e4", "u": "A", "v": "X", "length": 1},
+    {"id": "e5", "u": "X", "v": "C", "length": 1},
+]
+# B 点 e1<->e2 转接极贵：最优为掉头绕行（行走 7、转接 0），
+# 而非更短行走 + 高转接的直连方案。
+DETOUR_COSTLY = {
+    "nodes": DETOUR_NODES, "edges": DETOUR_EDGES, "start": "A",
+    "transferMode": True,
+    "rules": [{"node": "B", "edgeA": "e1", "edgeB": "e2", "cost": 100}],
+}
+# 同样的转接禁行：路径图 A-B-C 无任何替代回路，闭游不可行。
+PATH_NODES = ["A", "B", "C"]
+PATH_EDGES = [
+    {"id": "e1", "u": "A", "v": "B", "length": 1},
+    {"id": "e2", "u": "B", "v": "C", "length": 1},
+]
+PATH_FORBID = {
+    "nodes": PATH_NODES, "edges": PATH_EDGES, "start": "A",
+    "transferMode": True,
+    "rules": [{"node": "B", "edgeA": "e1", "edgeB": "e2", "cost": -1}],
+}
+
 
 def stage(name):
     print(f"\n=== {name} ===", flush=True)
@@ -89,7 +118,7 @@ def run_pytest() -> bool:
 
 
 def run_domain_checks() -> bool:
-    stage("2/3 奇度同优分类 & 欧拉零增程边界")
+    stage("2/3 奇度同优/欧拉零增程 & 转接模式边界（高耗时绕行、禁行无解）")
     from app.solver import audit
 
     # odd network: K4 unit weights -> 4 odd vertices, 3 distinct optima
@@ -140,6 +169,53 @@ def run_domain_checks() -> bool:
     )
     check(len(r3.route) == 3 and r3.route[-1].to == "B",
           "欧拉回路从检修口出发并返回")
+
+    # ---- transfer-time mode boundaries ----
+    rt = audit(
+        DETOUR_COSTLY["nodes"], DETOUR_COSTLY["edges"],
+        DETOUR_COSTLY["start"], True, DETOUR_COSTLY["rules"],
+    )
+    check(rt.transfer_mode, "转接模式标志置位")
+    check(rt.walk_length == 7 and rt.transfer_cost == 0,
+          "高耗时转接：最优为行走 7、转接 0 的掉头绕行（而非更短的高耗时走法）")
+    check(rt.optimal_count >= 1, "高耗时绕行存在最优路线")
+    check(
+        rt.route[0].frm == "A" and rt.route[-1].to == "A"
+        and len(rt.route) == sum(rt.multiplicity),
+        "高耗时绕行规范路线闭合、副本数吻合",
+    )
+    # the costly rule is declared but never used in the canonical walk
+    check(rt.rule_hits[("B", "e1", "e2")] == (),
+          "高耗时规则在规范路线中零命中")
+
+    rz = audit(
+        DETOUR_COSTLY["nodes"], DETOUR_COSTLY["edges"],
+        DETOUR_COSTLY["start"], True, [],
+    )
+    check(rz.walk_length == 6 and rz.transfer_cost == 0,
+          "无规则基线：行走 6（直连重复），证明耗时规则真正改变最优走法")
+
+    from app.solver import AuditError
+    try:
+        audit(PATH_FORBID["nodes"], PATH_FORBID["edges"],
+              PATH_FORBID["start"], True, PATH_FORBID["rules"])
+        raise AssertionError("禁行无解用例应当抛出 AuditError")
+    except AuditError as exc:
+        check("无可行闭游" in exc.message and "rules" in exc.fields,
+              "禁行转接导致无可行闭游并定位到规则表")
+
+    # bad rule references keep the structured error contract
+    for bad_rules, needle in (
+        ([{"node": "B", "edgeA": "e1", "edgeB": "x", "cost": 1}], "不存在"),
+        ([{"node": "A", "edgeA": "e1", "edgeB": "e2", "cost": 1}], "相邻"),
+        ([{"node": "B", "edgeA": "e1", "edgeB": "e2", "cost": "abc"}], "非负整数"),
+    ):
+        try:
+            audit(PATH_FORBID["nodes"], PATH_FORBID["edges"], "A", True, bad_rules)
+            raise AssertionError(f"非法规则未被拒绝: {bad_rules}")
+        except AuditError as exc:
+            check(needle in exc.message and "rules" in exc.fields,
+                  f"非法规则（{needle}）被拒绝并定位")
     return True
 
 
@@ -183,7 +259,7 @@ def _post(base: str, path: str, body: dict):
 
 
 def run_http_smoke() -> bool:
-    stage("3/3 HTTP 冒烟 (health / audit 成功 / audit 失败)")
+    stage("3/3 HTTP 冒烟（普通回归 / 转接高耗时绕行 / 禁行无解 / 非法输入）")
     base = os.environ.get("BASE_URL", "").rstrip("/")
     proc = None
     if not base:
@@ -225,6 +301,36 @@ def run_http_smoke() -> bool:
         check("edges" in body.get("fields", []), "自环错误定位到管段表")
         check(any(l.get("row") == 0 for l in body.get("locations", [])),
               "错误位置精确到第 1 行")
+
+        # transfer-time mode: costly switch detour
+        status, body = _post(base, "/api/audit", DETOUR_COSTLY)
+        check(status == 200 and body.get("ok") is True
+              and body.get("mode") == "transfer",
+              "转接模式审计成功")
+        check(body.get("walkLength") == 7 and body.get("transferCost") == 0
+              and body.get("totalTime") == 7,
+              "高耗时绕行：行走 7 / 转接 0 / 总耗时 7")
+        check(body.get("rules", [{}])[0].get("positions") == [],
+              "高耗时禁避规则无命中位置")
+        check(
+            body.get("route", [{}])[0].get("from") == "A"
+            and body.get("route", [{}])[-1].get("to") == "A",
+            "转接模式路线闭合",
+        )
+
+        # transfer-time mode: forbidden switch, no feasible tour
+        status, body = _post(base, "/api/audit", PATH_FORBID)
+        check(status == 200 and body.get("ok") is False,
+              "禁行无解返回 ok=false")
+        check("无可行闭游" in body.get("error", "")
+              and "rules" in body.get("fields", []),
+              "禁行无解定位到转接规则表")
+
+        # normal-mode regression over HTTP (historical fields intact)
+        status, body = _post(base, "/api/audit", TRIANGLE)
+        check(body.get("mode") == "normal" and body.get("addedLength") == 0
+              and body.get("canonicalVector") == "000",
+              "普通模式审计字段保持兼容")
         return True
     finally:
         if proc is not None:
@@ -254,7 +360,7 @@ def main() -> int:
     if failures:
         print("VERIFY 失败：" + "、".join(failures))
         return 1
-    print("VERIFY 全部通过：测试 / 奇度同优分类 / 欧拉零增程 / HTTP 冒烟")
+    print("VERIFY 全部通过：测试 / 奇度同优分类 / 欧拉零增程 / 转接耗时模式 / HTTP 冒烟")
     return 0
 
 
